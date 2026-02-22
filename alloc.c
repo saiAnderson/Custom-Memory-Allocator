@@ -3,10 +3,12 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include <unistd.h>
 
 #define HEAP_SIZE   256
 #define ALIGNMENT   16
 #define CHUNK_SIZE 1<<12
+#define MAX(a,b) ((a) > (b) ? (a):(b))
 
 // prototypes
 static void mark_free(void* ptr);
@@ -18,8 +20,6 @@ static uint8_t heap[HEAP_SIZE];
 static uint8_t* heap_start; // heap 起點 (指到 prologue header 的位置)
 static uint8_t* heap_end; // 目前 epilogue header 的位址
 
-
-
 // 因為要對齊 16 bytes
 static const size_t base = 8;
 
@@ -28,6 +28,10 @@ typedef uint64_t hdr_t;
 
 static size_t align16(size_t x){
     return ((x+(ALIGNMENT-1)) & ~(ALIGNMENT-1));
+}
+
+static size_t align16_down(size_t x){
+    return (x & ~0xF);
 }
 
 static hdr_t pack(size_t size,int alloc) {
@@ -58,24 +62,52 @@ static int get_alloc(hdr_t h) {return (int)(h & 1ULL);}
 // 也就是： 
 // Epilogue header 是為了讓 “next_header” 永遠存在
 
+void* mem_sbrk(intptr_t incr){
+    void* allocated_memory = sbrk(incr);
+
+    if(allocated_memory == (void * )-1) {
+        perror("sbrk 配置失敗");
+        return (void * )-1;
+    }
+
+    return allocated_memory;
+}
+
 bool  mm_init(void){
-    memset(heap,0,sizeof(heap));
+    const size_t PROLOGUE_SIZE = 16;    // header+footer
+    const size_t EPILOGUE_SIZE = 8;     // header only
+    const size_t CHUNK = 4096;          // 初始 chunk 
 
-    // Prologue(16,alloc=1) 
-    *(hdr_t*)(heap+0+base) = pack(16,1); // Prologue header
-    *(hdr_t*)(heap+8+base) = pack(16,1); // Prologue footer
+    uint8_t*  raw = (uint8_t *) mem_sbrk(CHUNK + 16);
+    if(raw == (uint8_t*)-1) return false;
 
-    // Free block(free_size,alloc=0)
-    size_t free_size = HEAP_SIZE-16-8-base; // 扣掉 prologue(16) + epilogue header(8) - padding(8) (for 16 bytes alignment)
-    free_size = align16(free_size);
-    *(hdr_t*)(heap+16+base) = pack(free_size,0); // free space header
-    *(hdr_t*)(heap+16+free_size-8+base) = pack(free_size,0); // free space footer
+    uintptr_t p = (uintptr_t) raw; // 把 raw 這個指標所代表的位址，轉成一個“可以裝得下位址”的無號整數。
+    uint8_t* heap_base = (uint8_t *)((p + 15) & ~(uintptr_t)0xF); // 先把 heap base 對齊到 16
+    heap_start = heap_base + base; // 讓第一個 header 在 8 mod 16
+    // => 第一個 payload = heap_start + 8 會是 16-aligned
+    
+    // assert(((uintptr_t)(heap_start + 8) & 0xF) == 0);
 
-    // Epilogue(0,alloc=1)
-    *(hdr_t*)(heap+16+free_size+base) = pack(0,1);
+    // prologue 
+    *(hdr_t *) heap_start = pack(PROLOGUE_SIZE,1);
+    *(hdr_t *) (heap_start + 8) = pack(PROLOGUE_SIZE,1);
+
+    // Free block
+    size_t pad = (uintptr_t)heap_base - (uintptr_t)raw;
+    size_t total_avail = (CHUNK + 16) - pad;
+    size_t free_size = total_avail - base - PROLOGUE_SIZE - EPILOGUE_SIZE; //( base | Prologue | Epilogue)
+    free_size = align16_down(free_size);
+    *(hdr_t *) (heap_start + 16) = pack(free_size, 0);
+    *(hdr_t *) (heap_start + 16 + free_size - 8) = pack(free_size, 0);
+
+    // Epilogue
+    *(hdr_t *) (heap_start + 16 + free_size) = pack(0, 1);
+
+    heap_end = heap_start + 16 + free_size;
 
     return true;
 }
+
 
 // [ header (8 bytes) | payload (N bytes) | footer (8 bytes) ]
 //                    ^
@@ -96,8 +128,8 @@ static void mark_free(void* ptr){
     hdr_t* ftr = (hdr_t*)((uint8_t*)ptr+block_size-16);
 
     // make hdr and ftr "alloc" equal false
-    *hdr &= ~1ULL;
-    *ftr &= ~1ULL;
+    *hdr = pack(block_size, 0);
+    *ftr = pack(block_size, 0);
 }
 
 static void* coalesce(void* ptr){
@@ -158,23 +190,62 @@ static void* coalesce(void* ptr){
     return ((uint8_t*)prev_hdr+8);
 }
 
+// [ 擴展前 ]
+// ... | 前一個 Block | 舊 Epilogue (8 bytes) | <-- program break
+
+// [ 擴展後 (sbrk 剛剛執行完) ]
+// ... | 前一個 Block | 舊 Epilogue (8 bytes) |--------- extend_size bytes ---------| <-- new break
+
+// [ 重新規劃 (我們真正要做的) ]
+// ... | 前一個 Block | 新 Free Header (8)    |... Payload ...| 新 Free Footer (8)  | 新 Epilogue (8) |
+//                    ^-------------------- 新的 Free Block (大小剛好是 extend_size)-----------------^
+void* extend_heap(size_t require_size){
+    size_t extend_size = align16(MAX(require_size, 4096));
+
+    hdr_t* old_Epilogue = (hdr_t *) heap_end;
+    
+    uint8_t* new_memory = (uint8_t*) mem_sbrk(extend_size);
+    if(new_memory == (uint8_t *)-1) return NULL;
+
+    // new free block header (新增加的加上原本 Epilogue 的 8 bytes)
+    *old_Epilogue = pack(extend_size, 0);
+
+    // new free block footer
+    *(hdr_t *)((uint8_t *)old_Epilogue + extend_size - 8) = pack(extend_size, 0);
+
+    // set new Epilogue and that heap_end point to it
+    *(hdr_t *)((uint8_t *)old_Epilogue + extend_size) = pack(0,1);
+
+    heap_end = ((uint8_t *)old_Epilogue + extend_size);
+
+    // coalesce
+    return coalesce((uint8_t *)old_Epilogue+8);
+}
+
+
 void* mm_malloc(size_t bytes) {
     // header(8 bytes) + footer(8 bytes)
     const size_t OVERHEAD = 16;
     // the minimun bytes the user require
     const size_t MIN_BLOCK = 32;
-    // the base(padding 8 bytes) + the first real block (header(8)+footer(8))
-    const size_t offset = base+16;
 
-    size_t total_size = OVERHEAD+bytes;
+    size_t total_size = OVERHEAD + bytes;
     total_size = align16(total_size);
     if(total_size < MIN_BLOCK) total_size = MIN_BLOCK;
 
-    hdr_t* block_header = (hdr_t*)(heap+offset);
+    hdr_t* block_header = (hdr_t*)(heap_start + 16);
     while(1){
         size_t block_size = get_size(*block_header);
         int block_alloc = get_alloc(*block_header);
-        if(block_size == 0ULL) break; // reach the Epilogue
+        
+        // reach the Epilogue
+        if(block_size == 0ULL){  
+            hdr_t *new_payload =  extend_heap(total_size);
+            if(new_payload == NULL) return NULL;
+            block_header = (hdr_t *)((uint8_t *)new_payload - 8); // 重新找一次
+            continue;
+        }
+
         if(block_size<total_size || block_alloc==1){
             block_header = (hdr_t*)((uint8_t*)block_header+block_size);
             continue;
@@ -209,12 +280,12 @@ void* mm_malloc(size_t bytes) {
 void  mm_dump(void){
     printf("===== HEAP DUMP =====\n");
 
-    size_t off = 8;
+    size_t off = 16;
+    hdr_t* current = (hdr_t *)(heap_start + 16);
 
     while(1){
-        hdr_t h = *(hdr_t*) (heap + off);
-        size_t size = get_size(h);
-        int alloc = get_alloc(h);
+        size_t size = get_size(*current);
+        int alloc = get_alloc(*current);
 
         if(size==0) {
             printf("EPILOGUE at off=%zu (alloc=%d)\n", off, alloc);
@@ -224,10 +295,7 @@ void  mm_dump(void){
         printf("BLOCK at off=%zu size=%zu alloc=%d\n", off, size, alloc);
 
         off += size;
-        if(off > HEAP_SIZE){
-            printf("ERROR: walked past heap end!\n");
-            break;
-        }
+        current = (hdr_t *)((uint8_t *)current + size);
     }
     printf("=====================\n");
 }

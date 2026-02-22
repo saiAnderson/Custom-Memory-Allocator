@@ -13,4 +13,5 @@ void  mm_free(void* ptr);
 void  mm_dump(void);
 
 // debug / helpers
+void* mem_sbrk(intptr_t incr);
 size_t mm_heap_bytes(void);
