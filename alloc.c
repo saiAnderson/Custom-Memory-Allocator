@@ -4,18 +4,28 @@
 #include <stdint.h>
 #include <string.h>
 #include <unistd.h>
+#include <assert.h>
+#include <stdbool.h>
 
-#define HEAP_SIZE   256
 #define ALIGNMENT   16
 #define CHUNK_SIZE 1<<12
 #define MAX(a,b) ((a) > (b) ? (a):(b))
 
+#define DEBUG_MALLOC 1
+#ifdef DEBUG_MALLOC
+    #define ASSERT_HEAP() do { \
+        if(!mm_checkheap(0)) { \
+            printf("ABORT: Heap corruption detected!\n"); \
+            exit(1); \
+        } \
+    } while(0)
+#else
+    #define ASSERT_HEAP() do {} while(0)
+#endif
+
 // prototypes
 static void mark_free(void* ptr);
 static void* coalesce(void* ptr);
-
-// --- 我們的 heap：先用固定陣列，之後再換 mmap ---
-static uint8_t heap[HEAP_SIZE];
 
 static uint8_t* heap_start; // heap 起點 (指到 prologue header 的位置)
 static uint8_t* heap_end; // 目前 epilogue header 的位址
@@ -62,15 +72,38 @@ static int get_alloc(hdr_t h) {return (int)(h & 1ULL);}
 // 也就是： 
 // Epilogue header 是為了讓 “next_header” 永遠存在
 
-void* mem_sbrk(intptr_t incr){
-    void* allocated_memory = sbrk(incr);
+// void* mem_sbrk(intptr_t incr){
+//     void* allocated_memory = sbrk(incr);
 
-    if(allocated_memory == (void * )-1) {
-        perror("sbrk 配置失敗");
-        return (void * )-1;
+//     if(allocated_memory == (void *)-1) {
+//         perror("sbrk 配置失敗");
+//         return (void * )-1;
+//     }
+//     return allocated_memory;
+// }
+
+// --- 模擬作業系統的記憶體空間 (例如 20 MB) ---
+#define MAX_HEAP_SIZE (20 * 1024 * 1024) 
+static uint8_t simulated_memory[MAX_HEAP_SIZE];
+
+// mem_brk 指向目前「模擬的 program break」
+static uint8_t* mem_brk = simulated_memory; 
+// 記憶體的最高界線
+static uint8_t* mem_max_addr = simulated_memory + MAX_HEAP_SIZE; 
+
+void* mem_sbrk(intptr_t incr){
+    uint8_t* old_brk = mem_brk;
+    
+    // 如果要求的空間小於 0，或者超出了我們的模擬上限，就拒絕他
+    if (incr < 0 || (mem_brk + incr > mem_max_addr)) {
+        printf("ERROR: mem_sbrk 模擬記憶體耗盡！\n");
+        return (void *)-1;
     }
 
-    return allocated_memory;
+    // 移動 break 指標，就像真實的 sbrk 一樣
+    mem_brk += incr;
+    
+    return (void*)old_brk;
 }
 
 bool  mm_init(void){
@@ -86,7 +119,7 @@ bool  mm_init(void){
     heap_start = heap_base + base; // 讓第一個 header 在 8 mod 16
     // => 第一個 payload = heap_start + 8 會是 16-aligned
     
-    // assert(((uintptr_t)(heap_start + 8) & 0xF) == 0);
+    assert(((uintptr_t)(heap_start + 8) & 0xF) == 0);
 
     // prologue 
     *(hdr_t *) heap_start = pack(PROLOGUE_SIZE,1);
@@ -116,6 +149,8 @@ void  mm_free(void* ptr){
     if(ptr == NULL) return;
     mark_free(ptr);
     ptr = coalesce(ptr);
+
+    ASSERT_HEAP();
 }
 
 static void mark_free(void* ptr){
@@ -265,17 +300,97 @@ void* mm_malloc(size_t bytes) {
             *remain_header = pack(remain_size,0);
             *block_footer = pack(remain_size,0);
 
+            ASSERT_HEAP();
             return (uint8_t*)block_header+8;
         }
         else{
             *block_header = pack(block_size,1); 
             *block_footer = pack(block_size,1); 
+            ASSERT_HEAP();
             return (uint8_t*)block_header+8;
         }
     }
     return NULL;
 }
 
+
+bool mm_checkheap(int verbose) {
+    if(verbose){
+        printf("--- Starting Heap Check ---\n");
+    }
+
+    // 1. 檢查 Prologue (必須是 16 bytes 且 alloc=1)
+    hdr_t *prologue_header = (hdr_t *) heap_start;
+    if(get_size(*prologue_header) != 16 || !get_alloc(*prologue_header)){
+        printf("Heap Check Error: Bad Prologue Header!\n");
+        return false;
+    }
+
+    uint8_t *current = heap_start + 16;
+    int prev_alloc = 1;
+
+    while(1){
+        hdr_t *hdr = (hdr_t *) current;
+        size_t size = get_size(*hdr);
+        int alloc = get_alloc(*hdr);
+
+        // 2. 檢查 Epilogue
+        if(size == 0){
+            if(!alloc){
+                printf("Heap Check Error: Epilogue is marked as FREE!\n");
+                return false;
+            }
+            if (current != heap_end) {
+                printf("Heap Check Error: Epilogue address (%p) mismatch with heap_end (%p)!\n", current, heap_end);
+                return false;
+            }
+            if (verbose) printf("  [OK] Epilogue reached.\n");
+            break; // 正常結束遍歷
+        }
+
+        // 3. 檢查對齊 (Payload 必須是 16 bytes 對齊)
+        uint8_t *payload = current + 8;
+        if((((uintptr_t)payload) % ALIGNMENT) != 0){
+            printf("Heap Check Error: Payload at %p is NOT %d-byte aligned!\n", payload, ALIGNMENT);
+            return false;
+        }
+
+        // 4. 檢查 Header 與 Footer 一致性
+        hdr_t *ftr = (hdr_t *)(current + size - 8);
+        if(get_size(*hdr) != get_size(*ftr)){
+            printf("Heap Check Error: Header size (%zu) != Footer size (%zu) at block %p\n", get_size(*hdr), get_size(*ftr), current);
+            return false;
+        }
+
+        if(get_alloc(*hdr) != get_alloc(*ftr)){
+            printf("Heap Check Error: Header alloc != Footer alloc at block %p\n", current);
+            return false;
+        }
+
+        // 5. 檢查連續 Free Blocks (逃脫的 Coalesce)
+        if(!alloc && !prev_alloc){
+            printf("Heap Check Error: Two consecutive FREE blocks found at %p (Coalesce failed!)\n", current);
+            return false;
+        }
+
+        if(verbose){
+            printf("  [OK] Block at %p: size=%zu, alloc=%d\n", current, size, alloc);
+        }
+
+        prev_alloc = alloc;
+        current += size;
+
+        // 6. 檢查邊界 (有沒有越界)
+        if (current > heap_end) {
+            printf("Heap Check Error: Block size %zu pushed pointer past heap_end!\n", size);
+            return false;
+        }
+    }
+    if (verbose) {
+        printf("--- Heap Check Passed ---\n");
+    }
+    return true;
+}
 
 void  mm_dump(void){
     printf("===== HEAP DUMP =====\n");

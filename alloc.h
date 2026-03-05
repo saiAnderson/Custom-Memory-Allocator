@@ -13,5 +13,6 @@ void  mm_free(void* ptr);
 void  mm_dump(void);
 
 // debug / helpers
+bool mm_checkheap(int verbose);
 void* mem_sbrk(intptr_t incr);
 size_t mm_heap_bytes(void);
